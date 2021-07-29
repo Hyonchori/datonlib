@@ -1,0 +1,3 @@
+https://github.com/ultralytics/yolov5
+https://github.com/miguelvr/dropblock
+https://github.com/miguelvr/dropblock/blob/master/dropblock/dropblock.py
