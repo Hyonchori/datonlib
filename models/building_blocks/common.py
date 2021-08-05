@@ -75,7 +75,7 @@ class SEModule(nn.Module):
 
 class ResidualBlock(nn.Module):
     # Residual block. arXiv:1512.03385
-    def __init__(self, c1, c2, k=3, s=1, act=True, use_se=True, se_r=16):
+    def __init__(self, c1, c2, k=3, s=1, act=True, use_se=True, se_r=16, shortcut=True):
         # in channel, out_channel, kernel size, stride, activation function, using SE module, reduction in SE
         super().__init__()
         self.conv = nn.Sequential(
@@ -84,18 +84,23 @@ class ResidualBlock(nn.Module):
             SEModule(c2, reduction=se_r) if use_se else nn.Identity()
         )
         self.act = nn.Mish() if act is True else (act if isinstance(act, nn.Module) else nn.Identity())
-        self.downsampling = PWConv(c1, c2, s) if c1 != c2 \
-            else (nn.MaxPool2d(k, stride=s) if s != 1 else nn.Identity())
+        if shortcut:
+            self.downsampling = PWConv(c1, c2, s) if c1 != c2 \
+                else (nn.MaxPool2d(k, stride=s) if s != 1 else nn.Identity())
+        self.shortcut = shortcut
 
     def forward(self, x):
         y = self.conv(x)
-        x = self.downsampling(x)
-        return self.act(x + y)
+        if self.shortcut:
+            x = self.downsampling(x)
+            return self.act(x + y)
+        else:
+            return self.act(y)
 
 
 class Bottleneck(nn.Module):
     # Bottleneck block. arXiv:1512.03385. = Inverted residual block(when b_e > 1) = MBConv block
-    def __init__(self, c1, c2, k=3, s=1, act=True, use_se=True, se_r=16, b_e=4):
+    def __init__(self, c1, c2, k=3, s=1, act=True, use_se=True, se_r=16, b_e=4, shortcut=True):
         # in channel, out_channel, kernel size, stride, activation, using SE module, reduction in SE, expansion ratio
         super().__init__()
         c_mid = int(c1 * b_e)
@@ -106,19 +111,24 @@ class Bottleneck(nn.Module):
             PWConv(c_mid, c2, 1, act=None)
         )
         self.act = nn.Mish() if act is True else (act if isinstance(act, nn.Module) else nn.Identity())
-        self.downsampling = PWConv(c1, c2, s) if c1 != c2 \
-            else (nn.MaxPool2d(k, stride=s) if s != 1 else nn.Identity())
+        if shortcut:
+            self.downsampling = PWConv(c1, c2, s) if c1 != c2 \
+                else (nn.MaxPool2d(k, stride=s) if s != 1 else nn.Identity())
+        self.shortcut = shortcut
 
     def forward(self, x):
         y = self.conv(x)
-        x = self.downsampling(x)
-        return self.act(x + y)
+        if self.shortcut:
+            x = self.downsampling(x)
+            return self.act(x + y)
+        else:
+            return self.act(y)
 
 
 class FusedBottleneck(nn.Module):
     # Fused bottleneck block. arXiv:2104.00298. = Fused MBConv block
     # Faster than Bottleneck when feature map resolution is high and channel is low
-    def __init__(self, c1, c2, k=3, s=1, act=True, use_se=True, se_r=16, b_e=4):
+    def __init__(self, c1, c2, k=3, s=1, act=True, use_se=True, se_r=16, b_e=4, shortcut=True):
         # in channel, out_channel, kernel size, stride, activation, using SE module, reduction in SE, expansion ratio
         super().__init__()
         c_mid = int(c1 * b_e)
@@ -128,13 +138,37 @@ class FusedBottleneck(nn.Module):
             PWConv(c_mid, c2, 1, act=None)
         )
         self.act = nn.Mish() if act is True else (act if isinstance(act, nn.Module) else nn.Identity())
-        self.downsampling = PWConv(c1, c2, s) if c1 != c2 \
-            else (nn.MaxPool2d(k, stride=s, padding=autopad(k, None)) if s != 1 else nn.Identity())
+        if shortcut:
+            self.downsampling = PWConv(c1, c2, s) if c1 != c2 \
+                else (nn.MaxPool2d(k, stride=s, padding=autopad(k, None)) if s != 1 else nn.Identity())
+        self.shortcut = shortcut
 
     def forward(self, x):
         y = self.conv(x)
-        x = self.downsampling(x)
-        return self.act(x + y)
+        if self.shortcut:
+            x = self.downsampling(x)
+            return self.act(x + y)
+        else:
+            return self.act(y)
+
+
+class BottleneckCSP(nn.Module):
+    # CSP bottleneck used in YOLO v5
+    def __init__(self, c1, c2, k=3, s=1, act=True, b_e=0.5, shortcut=True, fused=True, n=1):
+        super().__init__()
+        c_mid = int(c2 * b_e)
+        self.conv1 = ConvBnAct(c1, c_mid, 1, 1)
+        self.conv2 = ConvBnAct(c1, c_mid, 1, 1)
+        self.conv3 = ConvBnAct(2 * c_mid, c2, 1)
+        if fused:
+            self.m = nn.Sequential(
+                *[FusedBottleneck(c_mid, c_mid, shortcut=shortcut, b_e=1, use_se=False) for _ in range(n)])
+        else:
+            self.m = nn.Sequential(
+                *[Bottleneck(c_mid, c_mid, shortcut=shortcut, b_e=1, use_se=False) for _ in range(n)])
+
+    def forward(self, x):
+        return self.conv3(torch.cat((self.m(self.conv1(x)), self.conv2(x)), dim=1))
 
 
 class ConvDownSampling(nn.Module):
@@ -191,25 +225,30 @@ if __name__ == "__main__":
 
 
     t1 = time.time()
-    print("BasicConv: ", ConvBnAct(c_in, c_out)(sample).size(), time.time() - t1)
+    print("\nBasicConv: ", ConvBnAct(c_in, c_out)(sample).size(), time.time() - t1)
 
     t1 = time.time()
-    print("Depth-wise Conv: ", DWConv(c_in, c_out)(sample).size(), time.time() - t1)
+    print("\nDepth-wise Conv: ", DWConv(c_in, c_out)(sample).size(), time.time() - t1)
 
     t1 = time.time()
-    print("Point-wise Conv: ", PWConv(c_in, c_out)(sample).size(), time.time() - t1)
+    print("\nPoint-wise Conv: ", PWConv(c_in, c_out)(sample).size(), time.time() - t1)
 
     t1 = time.time()
-    print("Depth-wise separable Conv: ", DWSConv(c_in, c_out)(sample).size(), time.time() - t1)
+    print("\nDepth-wise separable Conv: ", DWSConv(c_in, c_out)(sample).size(), time.time() - t1)
 
     t1 = time.time()
-    print("Residual block: ", ResidualBlock(c_in, c_out)(sample).size(), time.time() - t1)
+    print("\nResidual block: ", ResidualBlock(c_in, c_out)(sample).size(), time.time() - t1)
 
     t1 = time.time()
-    print("Bottleneck(MBConv): ", Bottleneck(c_in, c_out)(sample).size(), time.time() - t1)
+    print("\nBottleneck(MBConv): ", Bottleneck(c_in, c_out)(sample).size(), time.time() - t1)
 
     t1 = time.time()
-    print("Fused MBConv: ", FusedBottleneck(c_in, c_out)(sample).size(), time.time() - t1)
+    print("\nFused MBConv: ", FusedBottleneck(c_in, c_out)(sample).size(), time.time() - t1)
+    print(FusedBottleneck(c_in, c_out))
+
+    t1 = time.time()
+    print("\nBottleneck CSP: ", BottleneckCSP(c_in, c_out)(sample).size(), time.time() - t1)
+    print(BottleneckCSP(c_in, c_out))
 
     t1 = time.time()
     print(ConvDownSampling(c_in, c_out)(sample).size(), time.time() - t1)
