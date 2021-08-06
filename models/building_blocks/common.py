@@ -153,8 +153,8 @@ class FusedBottleneck(nn.Module):
 
 
 class BottleneckCSP(nn.Module):
-    # CSP bottleneck used in YOLO v5
-    def __init__(self, c1, c2, k=3, s=1, act=True, b_e=0.5, shortcut=True, fused=True, n=1):
+    # CSP bottleneck used in YOLOv5
+    def __init__(self, c1, c2, n=1, b_e=0.5, shortcut=True, fused=True):
         super().__init__()
         c_mid = int(c2 * b_e)
         self.conv1 = ConvBnAct(c1, c_mid, 1, 1)
@@ -171,10 +171,51 @@ class BottleneckCSP(nn.Module):
         return self.conv3(torch.cat((self.m(self.conv1(x)), self.conv2(x)), dim=1))
 
 
+class ConcatLayer(nn.Module):
+    # Implementation of torch.cat() in layer
+    def __init__(self, dimension=1):
+        super().__init__()
+        self.d = dimension
+
+    def forward(self, xs):
+        # xs = iterable of torch.tensor: (tensor, tensor, ...) or [tensor, tensor, ...]
+        return torch.cat(xs, self.d)
+
+
+class SPP(nn.Module):
+    # Spatial pyramid pooling layer used in YOLOv3-SPP
+    def __init__(self, c1, c2, k=(5, 9, 3)):
+        super().__init__()
+        c_mid = c1 // 2
+        self.conv1 = ConvBnAct(c1, c_mid, 1, 1)
+        self.conv2 = ConvBnAct(c_mid * (len(k) + 1), c2, 1, 1)
+        self.m = nn.ModuleList([nn.MaxPool2d(kernel_size=x, stride=1, padding=x // 2) for x in k])
+
+    def forward(self, x):
+        x = self.conv1(x)
+        return self.conv2(torch.cat([x] + [m(x) for m in self.m], 1))
+
+
+class Focus(nn.Module):
+    # Focus layer used in YOLOv5
+    def __init__(self, c1, c2, k=1, s=1, p=None, g=1, act=True):
+        # in channel, out channel, kernel size, stride, groups, activation
+        super().__init__()
+        self.conv = ConvBnAct(c1 * 4, c2, k, s, p, g, act)  # point-wise conv when k=1
+
+    def forward(self, x):
+        # x(b, c, w, h) -> y(b, 4c, w/2, h/2)
+        return self.conv(torch.cat([x[..., ::2, ::2],
+                                    x[..., 1::2, ::2],
+                                    x[..., ::2, 1::2],
+                                    x[..., 1::2, 1::2]],
+                                   1))
+
+
 class ConvDownSampling(nn.Module):
     # Downsampling module concatenating max pooling and convolution with stride > 1
     def __init__(self, c1, c2, k=3, s=2, g=1, act=True):
-        # in channel, out channel, kernel size, stride, gropus, activation
+        # in channel, out channel, kernel size, stride, groups, activation
         super().__init__()
         self.conv = ConvBnAct(c1, c2, k, s, g=g, act=act)
         self.maxpool = nn.MaxPool2d(k, stride=s, padding=autopad(k, None))
@@ -244,11 +285,15 @@ if __name__ == "__main__":
 
     t1 = time.time()
     print("\nFused MBConv: ", FusedBottleneck(c_in, c_out)(sample).size(), time.time() - t1)
-    print(FusedBottleneck(c_in, c_out))
 
     t1 = time.time()
-    print("\nBottleneck CSP: ", BottleneckCSP(c_in, c_out)(sample).size(), time.time() - t1)
-    print(BottleneckCSP(c_in, c_out))
+    print("\nBottleneck CSP: ", BottleneckCSP(c_in, c_out, fused=False, n=4)(sample).size(), time.time() - t1)
+
+    t1 = time.time()
+    print("\nSPP: ", SPP(c_in, c_out)(sample).size(), time.time() - t1)
+
+    t1 = time.time()
+    print("\nFocus: ", Focus(c_in, c_out)(sample).size(), time.time() - t1)
 
     t1 = time.time()
     print(ConvDownSampling(c_in, c_out)(sample).size(), time.time() - t1)
